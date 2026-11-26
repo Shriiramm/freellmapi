@@ -1,0 +1,256 @@
+# Builds upstream FreeLLMAPI at one pinned commit into a self-contained macOS arm64 bundle.
+# Lives in a public fork; checks out the ORIGINAL upstream repo at the pinned SHA, so the fork
+# contributes only this file. Manual trigger only. No secrets are used.
+name: build-freellmapi-macos-arm64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-freellmapi
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: tashfeenahmed/freellmapi
+  UPSTREAM_SHA: b8a3436e17ab21faa4cfa89384aca69fae1e1501
+  UPSTREAM_TAG: v0.16.30
+  NODE_VERSION: 24.22.3        # = the Mac's node -v
+  EXPECTED_ABI: "137"          # = the Mac's process.versions.modules
+  MAX_MINOS: "26.5"            # Mac runs macOS 26.5.1; every native file must target <= this
+  MAX_TARBALL_MB: "200"
+  ART: freellmapi-v0.16.30-b8a3436-darwin-arm64-node24.22.3
+  # The only packages allowed to declare install scripts (reviewed in Checkpoint 1B).
+  EXPECTED_INSTALL_SCRIPTS: "better-sqlite3@12.10.0 esbuild@0.28.2 fsevents@2.3.3 msw@2.14.6"
+  npm_config_audit: "false"
+  npm_config_fund: "false"
+  npm_config_update_notifier: "false"
+
+jobs:
+  build:
+    runs-on: macos-15            # GitHub-hosted, arm64 (M1), free on public repos
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write            # build provenance (Sigstore)
+      attestations: write
+    steps:
+      - name: Verify runner is Apple silicon macOS
+        run: |
+          set -euo pipefail
+          sw_vers; uname -m; sysctl -n machdep.cpu.brand_string
+          echo "image: ${ImageOS:-?} ${ImageVersion:-?}"
+          test "$(uname -m)" = arm64
+          test "$(sysctl -n hw.optional.arm64)" = 1
+
+      - name: Check out upstream at the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_SHA }}
+          path: src
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify commit
+        run: |
+          set -euo pipefail
+          test "$(git -C src rev-parse HEAD)" = "$UPSTREAM_SHA"
+          test ! -e src/.npmrc
+
+      - name: Set up Node (exact version, no cache)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+          package-manager-cache: false
+
+      - name: Verify Node version, arch, ABI and registry
+        run: |
+          set -euo pipefail
+          node -p 'process.version + " " + process.arch + " abi " + process.versions.modules'
+          test "$(node -p process.version)" = "v$NODE_VERSION"
+          test "$(node -p process.arch)" = arm64
+          test "$(node -p process.versions.modules)" = "$EXPECTED_ABI"
+          test "$(npm config get registry)" = "https://registry.npmjs.org/"
+          npm -v
+
+      - name: Audit lockfile (hosts, integrity, install scripts)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          python3 -I - <<'EOF'
+          import json, os, sys
+          pk = json.load(open("package-lock.json"))["packages"]
+          deps = {k: v for k, v in pk.items() if "node_modules/" in k and not v.get("link")}
+          bad_host = [k for k, v in deps.items() if v.get("resolved") and not v["resolved"].startswith("https://registry.npmjs.org/")]
+          no_int = [k for k, v in deps.items() if v.get("resolved") and not str(v.get("integrity", "")).startswith("sha512-")]
+          scripts = sorted({k.split("node_modules/")[-1] + "@" + v.get("version", "") for k, v in deps.items() if v.get("hasInstallScript")})
+          expected = sorted(os.environ["EXPECTED_INSTALL_SCRIPTS"].split())
+          print(len(deps), "packages; install scripts:", scripts)
+          if bad_host or no_int or scripts != expected:
+              print("FAIL hosts:", bad_host[:5], "missing integrity:", no_int[:5], "unexpected scripts:", sorted(set(scripts) ^ set(expected)))
+              sys.exit(1)
+          EOF
+
+      - name: Install from lockfile with all lifecycle scripts disabled
+        working-directory: src
+        run: npm ci --ignore-scripts
+
+      - name: Run only the reviewed scripts; compile better-sqlite3 from source
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # esbuild postinstall only links/validates the prebuilt @esbuild/darwin-arm64 binary (needed by tests).
+          npm rebuild esbuild --foreground-scripts
+          # better-sqlite3: skip prebuild-install, compile its bundled SQLite source (covered by the
+          # lockfile sha512) with node-gyp against the headers shipped with this exact Node install.
+          NODEDIR="$(dirname "$(dirname "$(command -v node)")")"
+          test -f "$NODEDIR/include/node/node.h"
+          npm_config_build_from_source=true npm_config_nodedir="$NODEDIR" \
+            npm rebuild better-sqlite3 --foreground-scripts
+          B=node_modules/better-sqlite3
+          test -f "$B/build/Release/better_sqlite3.node"
+          test -d "$B/build/Release/obj.target"   # proves a local compile, not a downloaded prebuild
+          test ! -d "$B/prebuilds"
+
+      - name: Build
+        working-directory: src
+        run: npm run build
+
+      - name: Test (server and cli)
+        working-directory: src
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          npm test -w server
+          npm test -w cli
+
+      - name: Prune dev dependencies (mirrors upstream Dockerfile)
+        working-directory: src
+        run: npm prune --omit=dev --ignore-scripts
+
+      - name: Stage runtime bundle (same file set as upstream Dockerfile runtime stage)
+        run: |
+          set -euo pipefail
+          S="$RUNNER_TEMP/stage/$ART"; mkdir -p "$S/server" "$S/client" "$S/desktop"
+          cd src
+          cp package.json package-lock.json LICENSE "$S/"
+          cp -R node_modules "$S/node_modules"
+          [ -d server/node_modules ] && cp -R server/node_modules "$S/server/node_modules"
+          cp -R shared "$S/shared"
+          cp server/package.json "$S/server/"
+          cp desktop/package.json "$S/desktop/"
+          cp -R server/dist "$S/server/dist"
+          cp -R client/dist "$S/client/dist"
+          rm -rf "$S/node_modules/better-sqlite3/build/Release/obj.target" "$S/node_modules/better-sqlite3/build/Release/.deps"
+          # Nothing secret or config-like may ship.
+          test -z "$(find "$S" \( -name '.npmrc' -o -name '.env' -o -name '.env.*' -o -name '*.db' -o -name '.encryption-key' \) -not -name '.env.example' -print)"
+          # Native files: arm64 only, deployment target <= the Mac's macOS.
+          : > "$RUNNER_TEMP/native.txt"
+          find "$S" -type f \( -name '*.node' -o -name '*.dylib' \) -print0 | while IFS= read -r -d '' f; do
+            arch=$(lipo -archs "$f"); minos=$(otool -l "$f" | awk '/LC_BUILD_VERSION/{b=1} b&&/minos/{print $2; exit}')
+            echo "${f#$S/} arch=$arch minos=${minos:-?}" | tee -a "$RUNNER_TEMP/native.txt"
+            [ "$arch" = arm64 ] || { echo "non-arm64 native file"; exit 1; }
+            python3 -I -c "import sys;v=lambda s:[int(x) for x in s.split('.')];sys.exit(0 if v(sys.argv[1])<=v(sys.argv[2]) else 1)" "${minos:-99}" "$MAX_MINOS"
+          done
+          python3 -I - "$S" <<'EOF'
+          import json, os, platform, subprocess, sys
+          s = sys.argv[1]
+          info = {
+            "upstream_repo": os.environ["UPSTREAM_REPO"], "upstream_tag": os.environ["UPSTREAM_TAG"],
+            "upstream_sha": os.environ["UPSTREAM_SHA"], "node_version": subprocess.check_output(["node", "-p", "process.version"], text=True).strip(),
+            "node_abi": os.environ["EXPECTED_ABI"], "arch": platform.machine(),
+            "runner_macos": platform.mac_ver()[0], "runner_image": f'{os.environ.get("ImageOS","?")} {os.environ.get("ImageVersion","?")}',
+            "workflow_run": f'{os.environ["GITHUB_SERVER_URL"]}/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{os.environ["GITHUB_RUN_ID"]}',
+            "native_files": open(os.environ["RUNNER_TEMP"] + "/native.txt").read().splitlines(),
+            "start": "node server/dist/index.js",
+          }
+          json.dump(info, open(os.path.join(s, "BUILDINFO.json"), "w"), indent=2)
+          EOF
+          cd "$S" && find . -type f ! -name MANIFEST.sha256 -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 > MANIFEST.sha256
+          du -sh "$S"
+
+      - name: Create tarball and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          COPYFILE_DISABLE=1 tar --no-xattrs -czf "out/$ART.tar.gz" -C "$RUNNER_TEMP/stage" "$ART"
+          (cd out && shasum -a 256 "$ART.tar.gz" > "$ART.tar.gz.sha256" && cat "$ART.tar.gz.sha256")
+          cp "$RUNNER_TEMP/stage/$ART/BUILDINFO.json" out/
+          mb=$(( $(stat -f %z "out/$ART.tar.gz") / 1048576 )); echo "tarball ${mb} MB"
+          test "$mb" -le "$MAX_TARBALL_MB"
+
+      - name: Smoke test the packaged bundle in a kernel network sandbox (localhost only, no keys)
+        run: |
+          set -euo pipefail
+          # Isolation layers: (1) sandbox-exec denies every outbound connection and DNS lookup except
+          # loopback, proven by negative controls below; (2) live lsof monitoring fails on any
+          # non-loopback socket; (3) no provider keys exist; (4) catalog/update/probes off; (5) dead PROXY_URL.
+          command -v sandbox-exec
+          T="$RUNNER_TEMP/smoke"; mkdir -p "$T/data"
+          PROFILE='(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip "localhost:*"))'
+          SB() { sandbox-exec -p "$PROFILE" "$@"; }
+          # Negative controls (neutral host, never an AI provider): each must fail inside the sandbox.
+          if SB /usr/bin/curl -sS -m 5 -o /dev/null https://example.com; then echo "sandbox leak: curl"; exit 1; fi
+          SB node -e "fetch('https://example.com',{signal:AbortSignal.timeout(5000)}).then(()=>process.exit(1),()=>process.exit(0))" || { echo "sandbox leak: fetch"; exit 1; }
+          SB node -e "require('net').connect(443,'1.1.1.1').on('connect',()=>process.exit(1)).on('error',()=>process.exit(0))" || { echo "sandbox leak: raw IP"; exit 1; }
+          SB node -e "require('dns').lookup('example.com',e=>process.exit(e?0:1))" || { echo "sandbox leak: DNS"; exit 1; }
+          echo "negative controls: all outbound blocked"
+
+          tar -xzf "out/$ART.tar.gz" -C "$T"
+          cd "$T/$ART"
+          # Native modules load from the bundle alone (no source tree, no npm).
+          SB node --input-type=module -e "
+            import { createRequire } from 'node:module';
+            const req = createRequire(process.cwd() + '/server/package.json');
+            const Db = req('better-sqlite3'); const db = new Db(':memory:');
+            console.log('sqlite', db.prepare('select sqlite_version() v').get().v);
+            const sharp = req('sharp'); console.log('sharp', sharp.versions.sharp, 'vips', sharp.versions.vips);
+          "
+
+          SB env NODE_ENV=production HOST=127.0.0.1 PORT=3101 FREEAPI_DB_PATH="$T/data/freeapi.db" \
+            ENCRYPTION_KEY="$(openssl rand -hex 32)" FREELLMAPI_UPDATE_CHECK=off CATALOG_SYNC_DISABLED=1 \
+            COOLDOWN_PROBE_DISABLED=1 BUILTIN_MODEL_DISCOVERY=off REQUEST_ANALYTICS_LOG_CLIENT=false \
+            PROXY_URL=http://127.0.0.1:9 node server/dist/index.js > "$T/server.log" 2>&1 &
+          pid=$!
+          ok=0; foreign=""
+          for i in $(seq 1 60); do               # ~30 s observation window
+            foreign+=$(lsof -nP -a -p "$pid" -i -Fn 2>/dev/null | grep '^n' | grep -vE '^n(127\.0\.0\.1|\[::1\]|localhost|\*):[0-9]+$' | grep -vE '^n(127\.0\.0\.1|\[::1\]):[0-9]+->(127\.0\.0\.1|\[::1\]):[0-9]+$' || true)
+            [ "$ok" = 1 ] || { curl -fsS http://127.0.0.1:3101/api/ping >/dev/null 2>&1 && ok=1; }
+            sleep 0.5
+          done
+          lsof -nP -a -p "$pid" -i || true
+          listeners=$(lsof -nP -a -p "$pid" -iTCP -sTCP:LISTEN -Fn | grep '^n' | grep -v '^n127\.0\.0\.1:' || true)
+          kill "$pid" || true; wait "$pid" || true
+          cat "$T/server.log"
+          test "$ok" = 1 || { echo "server did not answer /api/ping"; exit 1; }
+          test -z "$listeners" || { echo "non-loopback listener: $listeners"; exit 1; }
+          test -z "$foreign" || { echo "non-loopback socket seen: $foreign"; exit 1; }
+          grep -q 'catalog-sync\] disabled' "$T/server.log"
+          echo "smoke test passed: bundle runs, loopback only, zero outbound sockets"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/${{ env.ART }}.tar.gz
+
+      - name: Upload tarball (unzipped, digest = attested file)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: out/${{ env.ART }}.tar.gz
+          archive: false
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload checksum and build info
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ART }}-metadata
+          path: |
+            out/${{ env.ART }}.tar.gz.sha256
+            out/BUILDINFO.json
+          retention-days: 7
+          if-no-files-found: error
