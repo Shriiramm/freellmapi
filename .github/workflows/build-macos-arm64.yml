@@ -120,6 +120,21 @@ jobs:
         working-directory: src
         run: npm run build
 
+      - name: Map ollama.localhost to loopback for the tests (macos-15 resolver gap)
+        run: |
+          set -euo pipefail
+          # RFC 6761: *.localhost is loopback, but the macos-15 resolver does not answer for
+          # subdomains, so proxy.test.ts (#951) fails with "could not resolve ollama.localhost".
+          # Gives the pinned guard the same answer upstream's fix f1c1159 (#2038) hardcodes.
+          # No source, test or URL-guard change; the runner VM is discarded after the job.
+          echo '127.0.0.1 ollama.localhost' | sudo tee -a /etc/hosts >/dev/null
+          check() { node -e "require('dns').lookup('ollama.localhost',{all:true},(e,a)=>{const s=e?[]:a.map(x=>x.address);console.log('ollama.localhost ->',e?e.code:s.join(','));process.exit(s.length&&s.every(x=>x==='127.0.0.1'||x==='::1')?0:1)})"; }
+          for i in 1 2 3 4 5; do check && exit 0; sleep 1; done
+          # Fallback only: mDNSResponder normally reloads /etc/hosts by itself.
+          sudo killall -HUP mDNSResponder
+          for i in 1 2 3 4 5; do check && exit 0; sleep 1; done
+          echo "::error::ollama.localhost does not resolve to loopback only"; exit 1
+
       - name: Test (server and cli)
         working-directory: src
         timeout-minutes: 20
